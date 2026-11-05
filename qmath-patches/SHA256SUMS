@@ -1,0 +1,4 @@
+0fe710e51854a5e3d66a69f8ffa9c11a8bf7634193ff04b9341ead136bd390d3  0001-Q-MATH-local-maintenance-on-upstream-9254f19.patch
+5f1843363f9f78c10f9cd8cbfca745bdaba502c554e2ad09b759ed9a6d14eae7  0002-Relax-Q-MATH-Rayon-guard-keep-Rayon-an-optional-kern.patch
+12315db6a050c8a162dc039b44986d51a09aa1e03762b871ae132ae613ca043d  0003-rayon-core-opt-in-batch-stealing-and-steal-groups.patch
+9c0f5eb9338e9a38e5d08e79e560f9273dece73b5bc61d5df8fc371a04680f7b  0004-docs-describe-the-Q-MATH-fork-differences-and-how-to.patch
