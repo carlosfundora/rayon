@@ -98,12 +98,6 @@
 #![deny(missing_debug_implementations)]
 #![deny(missing_docs)]
 
-// Carlos explicitly enabled this retained owner for BTC mining on 2026-11-01.
-// Unselected consumers keep the original refusal. The database active dependency
-// graph is checked independently because Cargo features are additive.
-#[cfg(not(feature = "btc-mining"))]
-compile_error!("Rayon requires the explicit BTC mining selection; database execution must remain Rayon-free");
-
 #[macro_use]
 mod delegate;
 

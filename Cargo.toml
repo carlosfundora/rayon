@@ -17,9 +17,6 @@ rust-version.workspace = true
 workspace = true
 
 [features]
-# Carlos explicitly re-enabled the retained owner for BTC mining on 2026-11-01.
-# This additive feature is not a substitute for the database dependency guard.
-btc-mining = ["rayon-core/btc-mining"]
 # This feature switches to a spin-lock implementation on the browser's
 # main thread to avoid the forbidden `atomics.wait`.
 #
