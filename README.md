@@ -1,8 +1,36 @@
 # Rayon
 
-## Q-MATH BTC selection — 2026-11-01
+## Q-MATH fork (`carlosfundora/rayon`, branch `qmath`)
 
-The retained Q-MATH owner is enabled by the explicit `btc-mining` feature forwarded from the BTC consumer through `runtime_zen2/btc-mining-rayon`. Unselected use keeps a compile-time refusal. The shipping BTC path uses its retained, explicitly sized provider with existing host admission and caller-controlled borrowed work; it does not select the global Rayon pool. Cargo features are additive, so the database client's active normal/build graph must independently remain free of Rayon and Rayon-core. This source integration preserves the retained Rayon implementation and establishes no throughput result.
+This is the Q-MATH fork of [`rayon-rs/rayon`](https://github.com/rayon-rs/rayon), based on upstream commit `9254f190aa7ee7521d528e839be3cd0921a04fd8`. Q-MATH consumes it as the submodule `hardware/rayon`, held only by the canonical Q-MATH checkout. Linked worktrees build through the workspace-policy wrapper's canonical local-source path. Upstream is fetch-only; nothing is pushed to `rayon-rs`.
+
+### Differences from upstream
+
+| Area | Difference | Behavior impact |
+|---|---|---|
+| **Scheduler (opt-in)** | `ThreadPoolBuilder::steal_batch_limit(k)`: an idle worker moves up to `k` jobs per steal from a victim's deque or the global injector (crossbeam-deque caps a batch at 32). Batching applies only when the thief is idle at the top of its stack; a worker waiting inside a running job keeps single-item stealing, so stolen subtrees cannot pile up on its stack. The thief always runs the *oldest* job of the batch, as upstream single-item stealing does. Crossbeam returns the youngest job of a batch stolen from a worker deque, so the fork pushes it back and takes the oldest from the front of its own deque. Short-circuiting consumers such as `find_any` depend on this order. Extra moved jobs are announced to the sleep counters. Broadcast jobs are never batched. | None unless set. The default `1` is upstream single-item stealing. |
+| **Scheduler (opt-in)** | `ThreadPoolBuilder::steal_groups(Vec<Vec<usize>>)`: an idle worker scans victims in its own locality group (e.g. one shared-L3 core complex, with workers pinned by the caller via `start_handler`) before all others. Groups must partition `0..num_threads`; otherwise `build` fails with a new `InvalidStealGroups` error. | None unless set. Every victim and the injector stay reachable. |
+| **Scheduler (opt-in)** | Environment fallbacks used only when the builder option is not set: `RAYON_STEAL_BATCH_LIMIT=<k>` and `RAYON_STEAL_GROUPS=contiguous:<n>` (consecutive thread-index blocks). | None when unset. |
+| Correctness/cleanup | `src/slice/sort.rs`: the block-partition length uses `offset_from`. `src/iter/test.rs`: a type-hint cleanup. `rayon-demo` `matmul` (cache-friendlier i-k-j loop) and `nbody` (one `next_velocity` with a parallel flag). | Same results. |
+| Toolchain | Workspace `rust-version = "1.98.1"` and `edition = "2021"` (upstream 1.85 / 2024); CI workflow pins 1.98.1; `ci/*` crates use edition 2021. | Build metadata only. |
+| Documentation/policy | `QMATH_VENDOR_PROVENANCE.md`, the agent policy files `AGENTS.md`/`CLAUDE.md`/`CODEX.md`, and Q-MATH language-policy comment headers in sources and docs. | None (comments and docs). |
+| Removed history | The 2026-11-01 `btc-mining` compile guard and its marker features were removed on 2026-11-05; the feature set is back to upstream's. | None. |
+
+Defaults are behavior-equivalent to upstream: with no option or environment variable set, scheduling, job order and results match `9254f19`. The opt-in options move whole jobs only; chunk boundaries, indices and collected results are unchanged.
+
+### Reapplying on a newer upstream
+
+`qmath-patches/` holds the complete Q-MATH delta as a `git format-patch` series from upstream `9254f19`, with `SHA256SUMS`. See `qmath-patches/README.md`. To move to a new upstream commit:
+
+```sh
+git fetch upstream
+git switch -c qmath-next <new-upstream-commit>
+git am --3way qmath-patches/*.patch        # resolve any conflicts, then `git am --continue`
+cargo test -p rayon-core && cargo test -p rayon
+```
+
+Then requalify the Q-MATH consumers, regenerate the series, push `qmath` to `origin`, and advance the Q-MATH `hardware/rayon` gitlink. The update procedure is also recorded in `QMATH_VENDOR_PROVENANCE.md`.
+
 
 [![Rayon crate](https://img.shields.io/crates/v/rayon.svg)](https://crates.io/crates/rayon)
 [![Rayon documentation](https://docs.rs/rayon/badge.svg)](https://docs.rs/rayon)
