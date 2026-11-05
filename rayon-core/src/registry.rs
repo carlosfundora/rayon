@@ -149,6 +149,12 @@ pub(super) struct Registry {
     start_handler: Option<Box<StartHandler>>,
     exit_handler: Option<Box<ExitHandler>>,
 
+    /// Q-MATH: maximum jobs moved per steal; 1 is upstream single-item stealing.
+    steal_batch_limit: usize,
+
+    /// Q-MATH: optional locality groups searched first when stealing.
+    steal_groups: Option<StealGroups>,
+
     // When this latch reaches 0, it means that all work on this
     // registry must be complete. This is ensured in the following ways:
     //
@@ -261,6 +267,14 @@ impl Registry {
         let n_threads = Ord::min(builder.get_num_threads(), crate::max_num_threads());
 
         let breadth_first = builder.get_breadth_first();
+        let steal_batch_limit = builder.get_steal_batch_limit();
+        let steal_groups = match builder.take_steal_groups(n_threads) {
+            Some(groups) => Some(
+                StealGroups::new(groups, n_threads)
+                    .map_err(|e| ThreadPoolBuildError::new(ErrorKind::InvalidStealGroups(e)))?,
+            ),
+            None => None,
+        };
 
         let (workers, stealers): (Vec<_>, Vec<_>) = (0..n_threads)
             .map(|_| {
@@ -292,6 +306,8 @@ impl Registry {
             panic_handler: builder.take_panic_handler(),
             start_handler: builder.take_start_handler(),
             exit_handler: builder.take_exit_handler(),
+            steal_batch_limit,
+            steal_groups,
         });
 
         // If we return early or panic, make sure to terminate existing threads.
@@ -622,6 +638,46 @@ impl Registry {
     }
 }
 
+/// Q-MATH: validated partition of thread indices into steal-locality groups.
+#[derive(Debug)]
+struct StealGroups {
+    /// Group id of each thread index.
+    group_of: Vec<usize>,
+    /// Thread indices of each group.
+    members: Vec<Vec<usize>>,
+}
+
+impl StealGroups {
+    fn new(groups: Vec<Vec<usize>>, num_threads: usize) -> Result<Self, String> {
+        let mut group_of = vec![usize::MAX; num_threads];
+        for (group, members) in groups.iter().enumerate() {
+            if members.is_empty() {
+                return Err(format!("steal group {group} is empty"));
+            }
+            for &index in members {
+                if index >= num_threads {
+                    return Err(format!(
+                        "steal group {group} names thread {index}, but the pool has {num_threads} threads"
+                    ));
+                }
+                if group_of[index] != usize::MAX {
+                    return Err(format!(
+                        "thread {index} appears in more than one steal group"
+                    ));
+                }
+                group_of[index] = group;
+            }
+        }
+        if let Some(missing) = group_of.iter().position(|&g| g == usize::MAX) {
+            return Err(format!("thread {missing} is not in any steal group"));
+        }
+        Ok(StealGroups {
+            group_of,
+            members: groups,
+        })
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct RegistryId {
     addr: usize,
@@ -676,6 +732,12 @@ pub(super) struct WorkerThread {
     /// A weak random number generator.
     rng: XorShift64Star,
 
+    /// Q-MATH: number of jobs currently executing on this worker's stack.
+    /// Batch stealing is only allowed at depth 0 (idle at the top of the
+    /// stack); nested waits keep single-item stealing so a waiting worker
+    /// cannot pile several large stolen subtrees onto its stack.
+    executing: Cell<usize>,
+
     registry: Arc<Registry>,
 }
 
@@ -696,6 +758,7 @@ impl From<ThreadBuilder> for WorkerThread {
             fifo: JobFifo::new(),
             index: thread.index,
             rng: XorShift64Star::new(),
+            executing: Cell::new(0),
             registry: thread.registry,
         }
     }
@@ -857,7 +920,7 @@ impl WorkerThread {
         // we take on something new.
         self.take_local_job()
             .or_else(|| self.steal())
-            .or_else(|| self.registry.pop_injected_job())
+            .or_else(|| self.pop_injected_job())
     }
 
     pub(super) fn yield_now(&self) -> Yield {
@@ -882,7 +945,24 @@ impl WorkerThread {
 
     #[inline]
     pub(super) unsafe fn execute(&self, job: JobRef) {
+        struct Depth<'a>(&'a Cell<usize>);
+        impl Drop for Depth<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        self.executing.set(self.executing.get() + 1);
+        let _depth = Depth(&self.executing);
         unsafe { job.execute() };
+    }
+
+    /// Q-MATH: effective batch limit for a steal right now (1 while nested).
+    fn steal_batch_limit_now(&self) -> usize {
+        if self.executing.get() == 0 {
+            self.registry.steal_batch_limit
+        } else {
+            1
+        }
     }
 
     /// Try to steal a single job and return it.
@@ -902,25 +982,126 @@ impl WorkerThread {
 
         loop {
             let mut retry = false;
-            let start = self.rng.next_usize(num_threads);
-            let job = (start..num_threads)
-                .chain(0..start)
-                .filter(move |&i| i != self.index)
-                .find_map(|victim_index| {
-                    let victim = &thread_infos[victim_index];
-                    match victim.stealer.steal() {
-                        Steal::Success(job) => Some(job),
-                        Steal::Empty => None,
-                        Steal::Retry => {
-                            retry = true;
-                            None
-                        }
-                    }
-                });
+            let job = match &self.registry.steal_groups {
+                // Q-MATH: same-group victims first (random start), then the rest.
+                Some(groups) => {
+                    let own_group = groups.group_of[self.index];
+                    let own = &groups.members[own_group];
+                    let near_start = self.rng.next_usize(own.len());
+                    let far_start = self.rng.next_usize(num_threads);
+                    own[near_start..]
+                        .iter()
+                        .chain(&own[..near_start])
+                        .copied()
+                        .chain(
+                            (far_start..num_threads)
+                                .chain(0..far_start)
+                                .filter(|&i| groups.group_of[i] != own_group),
+                        )
+                        .filter(|&i| i != self.index)
+                        .find_map(|victim| {
+                            self.steal_from(&thread_infos[victim].stealer, &mut retry)
+                        })
+                }
+                None => {
+                    let start = self.rng.next_usize(num_threads);
+                    (start..num_threads)
+                        .chain(0..start)
+                        .filter(|&i| i != self.index)
+                        .find_map(|victim| {
+                            self.steal_from(&thread_infos[victim].stealer, &mut retry)
+                        })
+                }
+            };
             if job.is_some() || !retry {
                 return job;
             }
             std::hint::spin_loop();
+        }
+    }
+
+    /// Steal from one victim. With `steal_batch_limit > 1` and the worker idle at
+    /// the top of its stack, up to that many jobs move into the (empty) local
+    /// deque in one operation; the first is returned and any extra moved jobs are
+    /// announced so sleeping peers can take them. Nested steals take one job.
+    fn steal_from(&self, stealer: &Stealer<JobRef>, retry: &mut bool) -> Option<JobRef> {
+        let limit = self.steal_batch_limit_now();
+        let result = if limit > 1 {
+            stealer.steal_batch_with_limit_and_pop(&self.worker, limit)
+        } else {
+            stealer.steal()
+        };
+        match result {
+            Steal::Success(job) if limit > 1 => self.oldest_after_batch(job),
+            Steal::Success(job) => Some(job),
+            Steal::Empty => None,
+            Steal::Retry => {
+                *retry = true;
+                None
+            }
+        }
+    }
+
+    /// Q-MATH: restore upstream steal order after a batch steal from a worker.
+    ///
+    /// For a LIFO victim, crossbeam's `steal_batch_with_limit_and_pop` returns
+    /// the *youngest* job of the stolen batch and moves the older ones into our
+    /// deque. Upstream Rayon always executes the *oldest* (largest) job a thief
+    /// takes; short-circuiting consumers such as `find_any` depend on it (the
+    /// thief must start on the far half of a split range). Push the returned
+    /// job back and take the oldest stolen job from the front of our own deque,
+    /// so the thief runs exactly what a single-item steal would have given it
+    /// and the remaining stolen jobs keep their original relative order.
+    fn oldest_after_batch(&self, youngest: JobRef) -> Option<JobRef> {
+        if self.worker.is_empty() {
+            return Some(youngest);
+        }
+        self.worker.push(youngest);
+        let own = &self.registry.thread_infos[self.index].stealer;
+        loop {
+            match own.steal() {
+                Steal::Success(job) => {
+                    self.announce_moved_jobs();
+                    return Some(job);
+                }
+                Steal::Retry => std::hint::spin_loop(),
+                // Other thieves took every moved job, `youngest` included, in
+                // the meantime. Nothing was lost; this steal attempt found none.
+                Steal::Empty => return None,
+            }
+        }
+    }
+
+    /// Q-MATH: pop from the global injector, moving a batch into the local
+    /// deque when `steal_batch_limit > 1`.
+    fn pop_injected_job(&self) -> Option<JobRef> {
+        let limit = self.steal_batch_limit_now();
+        if limit <= 1 {
+            return self.registry.pop_injected_job();
+        }
+        loop {
+            match self
+                .registry
+                .injected_jobs
+                .steal_batch_with_limit_and_pop(&self.worker, limit)
+            {
+                Steal::Success(job) => {
+                    self.announce_moved_jobs();
+                    return Some(job);
+                }
+                Steal::Empty => return None,
+                Steal::Retry => std::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Jobs moved into the local deque by a batch are internal work: announce
+    /// them like `push` does so idle workers wake and can steal them.
+    fn announce_moved_jobs(&self) {
+        let moved = self.worker.len();
+        if moved > 0 {
+            let moved = u32::try_from(moved).unwrap_or(u32::MAX);
+            self.registry.sleep.new_internal_jobs(moved, true);
         }
     }
 }

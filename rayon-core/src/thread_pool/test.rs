@@ -433,3 +433,182 @@ fn yield_local_to_spawn() {
     // for it to finish if a different thread stole it first.
     assert_eq!(22, rx.recv().unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// Q-MATH fork: opt-in batch stealing and locality-grouped stealing.
+// ---------------------------------------------------------------------------
+
+/// Deep recursive join tree whose exact result depends on every leaf running once.
+fn join_tree_sum(lo: u64, hi: u64) -> u64 {
+    if hi - lo <= 64 {
+        return (lo..hi).sum();
+    }
+    let mid = lo + (hi - lo) / 2;
+    let (a, b) = join(|| join_tree_sum(lo, mid), || join_tree_sum(mid, hi));
+    a + b
+}
+
+fn exercise_pool(pool: &ThreadPool) {
+    const N: u64 = 1 << 20;
+    // join: every leaf exactly once, result independent of which worker stole it.
+    assert_eq!(pool.install(|| join_tree_sum(0, N)), N * (N - 1) / 2);
+    // scope/spawn: many small jobs through the local deques.
+    let counter = AtomicUsize::new(0);
+    pool.scope(|s| {
+        for _ in 0..10_000 {
+            s.spawn(|_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+    });
+    assert_eq!(counter.load(Ordering::Relaxed), 10_000);
+    // External injection path (`install` from outside the pool), repeated so the
+    // global injector is drained through the (possibly batched) injector pop.
+    let total: u64 = (0..64u64).map(|i| pool.install(|| i)).sum();
+    assert_eq!(total, 64 * 63 / 2);
+    // Broadcast jobs stay bound to their own thread and run exactly once each.
+    let mut seen = pool.broadcast(|ctx| ctx.index());
+    seen.sort_unstable();
+    assert_eq!(seen, (0..pool.current_num_threads()).collect::<Vec<_>>());
+}
+
+#[test]
+#[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+fn steal_batch_limit_preserves_results() {
+    for limit in [1, 2, 8, 32, 1000] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(4)
+            .steal_batch_limit(limit)
+            .build()
+            .unwrap();
+        exercise_pool(&pool);
+    }
+}
+
+#[test]
+#[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+fn steal_groups_preserve_results() {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(4)
+        .steal_groups(vec![vec![0, 1], vec![2, 3]])
+        .build()
+        .unwrap();
+    exercise_pool(&pool);
+    // Uneven groups and a single-thread group are valid partitions too.
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(5)
+        .steal_groups(vec![vec![4], vec![0, 2], vec![1, 3]])
+        .build()
+        .unwrap();
+    exercise_pool(&pool);
+}
+
+#[test]
+#[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+fn steal_batch_and_groups_together_survive_idle_sleep() {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(6)
+        .steal_batch_limit(8)
+        .steal_groups(vec![vec![0, 1, 2], vec![3, 4, 5]])
+        .build()
+        .unwrap();
+    for _ in 0..3 {
+        exercise_pool(&pool);
+        // Let every worker go idle and fall asleep, then wake them with new work.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn steal_groups_must_partition_thread_indices() {
+    let build = |groups: Vec<Vec<usize>>| {
+        ThreadPoolBuilder::new()
+            .num_threads(4)
+            .steal_groups(groups)
+            .build()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    assert!(build(vec![vec![0, 1], vec![1, 2, 3]])
+        .unwrap_err()
+        .contains("more than one"));
+    assert!(build(vec![vec![0, 1], vec![2]])
+        .unwrap_err()
+        .contains("not in any"));
+    assert!(build(vec![vec![0, 1, 2, 3, 4]])
+        .unwrap_err()
+        .contains("pool has 4 threads"));
+    assert!(build(vec![vec![0, 1, 2, 3], vec![]])
+        .unwrap_err()
+        .contains("is empty"));
+    assert!(build(vec![vec![3, 2, 1, 0]]).is_ok());
+}
+
+/// Fine-grained join tree (leaf size 1): maximal nesting under work stealing.
+fn fine_join_tree(lo: u64, hi: u64) -> u64 {
+    if hi - lo == 1 {
+        return lo;
+    }
+    let mid = lo + (hi - lo) / 2;
+    let (a, b) = join(|| fine_join_tree(lo, mid), || fine_join_tree(mid, hi));
+    a + b
+}
+
+/// Regression: a waiting worker must not pile several stolen subtrees onto its
+/// stack. Batch stealing is gated to idle (top-of-stack) workers, so small
+/// worker stacks survive deep fine-grained join trees with the maximum batch.
+#[test]
+#[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+fn steal_batch_limit_keeps_nested_stack_depth_bounded() {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(8)
+        .stack_size(256 * 1024)
+        .steal_batch_limit(32)
+        .build()
+        .unwrap();
+    const N: u64 = 1 << 18;
+    for _ in 0..8 {
+        assert_eq!(pool.install(|| fine_join_tree(0, N)), N * (N - 1) / 2);
+    }
+}
+
+/// Short-circuit search over `lo..hi` with `join`, the shape of `find_any`.
+fn first_above_half(lo: u128, hi: u128, half: u128, stop: &std::sync::atomic::AtomicBool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if stop.load(Relaxed) {
+        return false;
+    }
+    if hi - lo == 1 {
+        if lo > half {
+            stop.store(true, Relaxed);
+            return true;
+        }
+        return false;
+    }
+    let mid = lo + (hi - lo) / 2;
+    let (a, b) = join(
+        || first_above_half(lo, mid, half, stop),
+        || first_above_half(mid, hi, half, stop),
+    );
+    a || b
+}
+
+/// Regression: a batch-stealing thief must execute the *oldest* job it takes,
+/// as upstream single-item stealing does. Crossbeam returns the youngest job of
+/// a batch stolen from a LIFO deque; executing that one leaves the thief inside
+/// the never-matching lower half of a 2^100 range, so this search would not
+/// finish. Executing the oldest job (the upper half) finds a match at once.
+#[test]
+#[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+fn steal_batch_limit_thief_runs_oldest_job() {
+    for limit in [2, 8, 32] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(2)
+            .steal_batch_limit(limit)
+            .build()
+            .unwrap();
+        let n: u128 = 1 << 100;
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        assert!(pool.install(|| first_above_half(0, n, n / 2, &stop)));
+    }
+}

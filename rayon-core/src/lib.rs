@@ -160,6 +160,7 @@ enum ErrorKind {
     GlobalPoolAlreadyInitialized,
     CurrentThreadAlreadyInPool,
     IOError(io::Error),
+    InvalidStealGroups(String),
 }
 
 /// Used to create a new [`ThreadPool`] or to configure the global rayon thread pool.
@@ -211,6 +212,12 @@ pub struct ThreadPoolBuilder<S = DefaultSpawn> {
     /// "depth-first" fashion. If true, they will do a "breadth-first"
     /// fashion. Depth-first is the default.
     breadth_first: bool,
+
+    /// Q-MATH: maximum jobs moved per steal (1 = upstream single-item stealing).
+    steal_batch_limit: Option<usize>,
+
+    /// Q-MATH: locality groups of thread indices searched first when stealing.
+    steal_groups: Option<Vec<Vec<usize>>>,
 }
 
 /// Contains the rayon thread pool configuration. Use [`ThreadPoolBuilder`] instead.
@@ -247,6 +254,8 @@ impl Default for ThreadPoolBuilder {
             exit_handler: None,
             spawn_handler: DefaultSpawn,
             breadth_first: false,
+            steal_batch_limit: None,
+            steal_groups: None,
         }
     }
 }
@@ -458,6 +467,8 @@ impl<S> ThreadPoolBuilder<S> {
             start_handler: self.start_handler,
             exit_handler: self.exit_handler,
             breadth_first: self.breadth_first,
+            steal_batch_limit: self.steal_batch_limit,
+            steal_groups: self.steal_groups,
         }
     }
 
@@ -637,6 +648,52 @@ impl<S> ThreadPoolBuilder<S> {
         self.breadth_first
     }
 
+    /// Q-MATH extension: let an idle worker move up to `limit` jobs from a
+    /// victim's deque, or from the global injector, in one operation instead of
+    /// one job at a time. `limit <= 1` keeps upstream single-item stealing,
+    /// which is the default. crossbeam-deque also caps a batch at 32 jobs.
+    ///
+    /// Jobs move whole: chunk boundaries, indices and collected results are
+    /// unchanged, and broadcast jobs are never batched. When this is not set,
+    /// a positive integer in `RAYON_STEAL_BATCH_LIMIT` is used.
+    pub fn steal_batch_limit(mut self, limit: usize) -> Self {
+        self.steal_batch_limit = Some(limit);
+        self
+    }
+
+    /// Q-MATH extension: partition thread indices into locality groups, for
+    /// example one group per shared-L3 core complex with workers pinned by the
+    /// caller through [`start_handler`](Self::start_handler). An idle worker
+    /// scans its own group's victims first, then all others, so every victim
+    /// and the injector stay reachable and sleep/wake behavior is unchanged.
+    ///
+    /// `groups` must partition `0..num_threads` exactly (every index once),
+    /// otherwise [`build`](Self::build) fails. When this is not set,
+    /// `RAYON_STEAL_GROUPS=contiguous:N` groups consecutive thread indices.
+    pub fn steal_groups(mut self, groups: Vec<Vec<usize>>) -> Self {
+        self.steal_groups = Some(groups);
+        self
+    }
+
+    fn get_steal_batch_limit(&self) -> usize {
+        self.steal_batch_limit
+            .or_else(|| {
+                env::var("RAYON_STEAL_BATCH_LIMIT")
+                    .ok()
+                    .and_then(|value| parse_steal_batch_limit(&value))
+            })
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    fn take_steal_groups(&mut self, num_threads: usize) -> Option<Vec<Vec<usize>>> {
+        self.steal_groups.take().or_else(|| {
+            env::var("RAYON_STEAL_GROUPS")
+                .ok()
+                .and_then(|value| parse_steal_groups(&value, num_threads))
+        })
+    }
+
     /// Takes the current thread start callback, leaving `None`.
     fn take_start_handler(&mut self) -> Option<Box<StartHandler>> {
         self.start_handler.take()
@@ -773,12 +830,15 @@ impl Error for ThreadPoolBuildError {
             ErrorKind::GlobalPoolAlreadyInitialized => GLOBAL_POOL_ALREADY_INITIALIZED,
             ErrorKind::CurrentThreadAlreadyInPool => CURRENT_THREAD_ALREADY_IN_POOL,
             ErrorKind::IOError(ref e) => e.description(),
+            ErrorKind::InvalidStealGroups(ref e) => e,
         }
     }
 
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
-            ErrorKind::GlobalPoolAlreadyInitialized | ErrorKind::CurrentThreadAlreadyInPool => None,
+            ErrorKind::GlobalPoolAlreadyInitialized
+            | ErrorKind::CurrentThreadAlreadyInPool
+            | ErrorKind::InvalidStealGroups(_) => None,
             ErrorKind::IOError(e) => Some(e),
         }
     }
@@ -790,6 +850,7 @@ impl fmt::Display for ThreadPoolBuildError {
             ErrorKind::CurrentThreadAlreadyInPool => CURRENT_THREAD_ALREADY_IN_POOL.fmt(f),
             ErrorKind::GlobalPoolAlreadyInitialized => GLOBAL_POOL_ALREADY_INITIALIZED.fmt(f),
             ErrorKind::IOError(e) => e.fmt(f),
+            ErrorKind::InvalidStealGroups(e) => e.fmt(f),
         }
     }
 }
@@ -813,6 +874,8 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             ref exit_handler,
             spawn_handler: _,
             ref breadth_first,
+            ref steal_batch_limit,
+            ref steal_groups,
         } = *self;
 
         // Just print `Some(<closure>)` or `None` to the debug
@@ -837,6 +900,8 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             .field("start_handler", &start_handler)
             .field("exit_handler", &exit_handler)
             .field("breadth_first", &breadth_first)
+            .field("steal_batch_limit", &steal_batch_limit)
+            .field("steal_groups", &steal_groups)
             .finish()
     }
 }
@@ -873,5 +938,59 @@ impl FnContext {
     #[inline]
     pub fn migrated(&self) -> bool {
         self.migrated
+    }
+}
+
+/// Parse `RAYON_STEAL_BATCH_LIMIT`: a positive integer.
+fn parse_steal_batch_limit(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|&limit| limit > 0)
+}
+
+/// Parse `RAYON_STEAL_GROUPS`: `contiguous:N` groups consecutive thread
+/// indices `N` at a time (the last group may be smaller).
+fn parse_steal_groups(value: &str, num_threads: usize) -> Option<Vec<Vec<usize>>> {
+    let size = value
+        .trim()
+        .strip_prefix("contiguous:")?
+        .parse::<usize>()
+        .ok()?;
+    if size == 0 || num_threads == 0 {
+        return None;
+    }
+    Some(
+        (0..num_threads)
+            .collect::<Vec<_>>()
+            .chunks(size)
+            .map(<[usize]>::to_vec)
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod steal_option_parse_tests {
+    use super::{parse_steal_batch_limit, parse_steal_groups};
+
+    #[test]
+    fn batch_limit_accepts_only_positive_integers() {
+        assert_eq!(parse_steal_batch_limit("8"), Some(8));
+        assert_eq!(parse_steal_batch_limit(" 1 "), Some(1));
+        assert_eq!(parse_steal_batch_limit("0"), None);
+        assert_eq!(parse_steal_batch_limit("-2"), None);
+        assert_eq!(parse_steal_batch_limit("many"), None);
+    }
+
+    #[test]
+    fn contiguous_groups_partition_thread_indices() {
+        assert_eq!(
+            parse_steal_groups("contiguous:4", 10),
+            Some(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9]])
+        );
+        assert_eq!(parse_steal_groups("contiguous:0", 4), None);
+        assert_eq!(parse_steal_groups("l3", 4), None);
+        assert_eq!(parse_steal_groups("contiguous:2", 0), None);
     }
 }
